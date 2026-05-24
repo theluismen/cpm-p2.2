@@ -34,28 +34,21 @@ int main(int argc, char** argv)
 {
     int i, j, k;
     int rank, nodos;
-    int i_ini, i_fin, cols_per_node, local_cols;
+    int i_ini, i_fin, cols_per_node;
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nodos);
 
-    cols_per_node = N / nodos;
-    i_ini = rank * cols_per_node;
-    i_fin = (rank == nodos - 1) ? N : (rank + 1) * cols_per_node;
-    local_cols = i_fin - i_ini;
-
-    /* RESERVA DINÁMICA ÓPTIMA - Formato Column-Major */
     int *A  = calloc(N * N, sizeof(int));
     int *B  = calloc(N * N, sizeof(int));
-    // Arrays locales agrupados por columna para indexar así: [offset_columna + fila]
-    int *C1_local = calloc(local_cols * N, sizeof(int));
-    int *C2_local = calloc(local_cols * N, sizeof(int));
+    int *C1 = calloc(N * N, sizeof(int));
+    int *C2 = calloc(N * N, sizeof(int));
     
     int *jBD = malloc(sizeof(int) * (N + 1));
     tmd *AD  = malloc(sizeof(tmd) * ND);
     tmd *BD  = malloc(sizeof(tmd) * ND);
-    tmd *CD_local = malloc(sizeof(tmd) * N * local_cols); 
+    tmd *CD  = malloc(sizeof(tmd) * N * N);
 
     for ( k = 0; k < ND; k++ )
     {
@@ -70,6 +63,7 @@ int main(int argc, char** argv)
         A[AD[k].i * N + AD[k].j] = AD[k].v;
     }
     qsort(AD, ND, sizeof(tmd), cmp_fil);
+
     free(A);
 
     for ( k = 0; k < ND; k++ )
@@ -93,19 +87,19 @@ int main(int argc, char** argv)
         jBD[j] = k;
     }
 
+    cols_per_node = N / nodos;
+    i_ini = rank * cols_per_node;
+    i_fin = (rank == nodos - 1) ? N : (rank + 1) * cols_per_node;
+
     int *VB_local = malloc(sizeof(int) * N);
     int *VC_local = malloc(sizeof(int) * N);
     int neleC_local = 0;
 
-    // Cálculo 1
     for ( i = i_ini; i < i_fin; i++ )
     {
-        int local_i = i - i_ini;
-        int offset = local_i * N; // MAGIA: Calculamos el salto aquí, no en el bucle interno
-        
         for ( j = 0; j < N; j++ )
         {
-            VB_local[j] = B[j * N + i]; 
+            VB_local[j] = B[j * N + i];
             VC_local[j] = 0;
         }
 
@@ -114,17 +108,11 @@ int main(int argc, char** argv)
 
         for ( j = 0; j < N; j++ )
             if ( VC_local[j] )
-                C1_local[offset + j] = VC_local[j]; // Acceso súper limpio
+                C1[j * N + i] = VC_local[j];
     }
 
-    free(B); // Liberar antes del Cálculo 2
-
-    // Cálculo 2
     for ( i = i_ini; i < i_fin; i++ )
     {
-        int local_i = i - i_ini;
-        int offset = local_i * N; // MAGIA
-
         for ( j = 0; j < N; j++ )
             VB_local[j] = 0;
 
@@ -132,10 +120,9 @@ int main(int argc, char** argv)
             VB_local[BD[k].i] = BD[k].v;
 
         for ( k = 0; k < ND; k++ )
-            C2_local[offset + AD[k].i] += AD[k].v * VB_local[AD[k].j]; // ¡Cero multiplicaciones!
+            C2[AD[k].i * N + i] += AD[k].v * VB_local[AD[k].j];
     }
 
-    // Cálculo 3
     for ( i = i_ini; i < i_fin; i++ )
     {
         for ( j = 0; j < N; j++ )
@@ -152,89 +139,50 @@ int main(int argc, char** argv)
             VB_local[j] = 0;
             if ( VC_local[j] )
             {
-                CD_local[neleC_local].i = j;
-                CD_local[neleC_local].j = i; 
-                CD_local[neleC_local].v = VC_local[j];
+                CD[neleC_local].i = j;
+                CD[neleC_local].j = i;
+                CD[neleC_local].v = VC_local[j];
                 neleC_local++;
                 VC_local[j] = 0;
             }
         }
     }
 
-    /* Comprobaciones LOCALES ajustadas al nuevo formato */
-    for ( j = i_ini; j < i_fin; j++ ) {
-        int local_j = j - i_ini;
-        int offset = local_j * N;
-        for ( i = 0; i < N; i++ ) {
-            if ( C2_local[offset + i] != C1_local[offset + i] )
-                printf("Rank %d - Diferencies C1 i C2 pos %d,%d: %d != %d\n", rank, i, j, C1_local[offset + i], C2_local[offset + i]);
-        }
-    }
+    for ( j = i_ini; j < i_fin; j++ )
+        for ( i = 0; i < N; i++ )
+            if ( C2[i * N + j] != C1[i * N + j] )
+                printf("Rank %d - Diferencies C1 i C2 pos %d,%d: %d != %d\n", rank, i, j, C1[i * N + j], C2[i * N + j]);
 
     long long Suma_local = 0;
     for ( k = 0; k < neleC_local; k++ )
     {
-        Suma_local += CD_local[k].v;
-        int local_j = CD_local[k].j - i_ini;
-        int offset = local_j * N;
-        if ( CD_local[k].v != C1_local[offset + CD_local[k].i] )
+        Suma_local += CD[k].v;
+        if ( CD[k].v != C1[CD[k].i * N + CD[k].j] )
             printf("Rank %d - Diferencies C1 i CD a i:%d,j:%d,v%d, k:%d, vd:%d\n",
-                   rank, CD_local[k].i, CD_local[k].j, C1_local[offset + CD_local[k].i], k, CD_local[k].v);
+                   rank, CD[k].i, CD[k].j, C1[CD[k].i * N + CD[k].j], k, CD[k].v);
     }
 
-    /* Recolección en Proceso 0 */
     long long Suma_global = 0;
     int neleC_global = 0;
 
     MPI_Reduce(&Suma_local, &Suma_global, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&neleC_local, &neleC_global, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    MPI_Datatype MPI_TMD;
-    MPI_Type_contiguous(3, MPI_INT, &MPI_TMD);
-    MPI_Type_commit(&MPI_TMD);
-
-    int *recvcounts = NULL;
-    int *displs = NULL;
-    tmd *CD_global = NULL;
-
-    if ( rank == 0 ) {
-        recvcounts = malloc(nodos * sizeof(int));
-        displs = malloc(nodos * sizeof(int));
-    }
-
-    MPI_Gather(&neleC_local, 1, MPI_INT, recvcounts, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    if ( rank == 0 ) {
-        int total_elements = 0;
-        for ( i = 0; i < nodos; i++ ) {
-            displs[i] = total_elements;
-            total_elements += recvcounts[i];
-        }
-        CD_global = malloc(sizeof(tmd) * total_elements);
-    }
-
-    MPI_Gatherv(CD_local, neleC_local, MPI_TMD, CD_global, recvcounts, displs, MPI_TMD, 0, MPI_COMM_WORLD);
-
     if ( rank == 0 ) {
         printf("\nNumero elements de la matriu dispersa C %d\n", neleC_global);
         printf("Suma dels elements de C %lld \n", Suma_global);
     }
 
-    free(C1_local);
-    free(C2_local);
+    free(B);
+    free(C1);
+    free(C2);
     free(jBD);
     free(AD);
     free(BD);
-    free(CD_local);
+    free(CD);
     free(VB_local);
     free(VC_local);
-    if ( rank == 0 ) {
-        free(recvcounts);
-        free(displs);
-        free(CD_global);
-    }
 
-    MPI_Type_free(&MPI_TMD);
     MPI_Finalize();
     exit(0);
 }
